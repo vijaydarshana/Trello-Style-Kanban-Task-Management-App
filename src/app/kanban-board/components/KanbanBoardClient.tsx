@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -33,6 +33,7 @@ import type { Card } from '../types';
 export default function KanbanBoardClient() {
   const {
     board,
+    isLoading,
     addColumn,
     renameColumn,
     deleteColumn,
@@ -55,6 +56,9 @@ export default function KanbanBoardClient() {
   const [deletingColumnId, setDeletingColumnId] = useState<string | null>(null);
   const [overId, setOverId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Drag lock: prevents concurrent/fast-drag conflicts
+  const isDraggingRef = useRef(false);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -88,6 +92,8 @@ export default function KanbanBoardClient() {
 
   // DnD handlers
   const handleDragStart = useCallback((event: DragStartEvent) => {
+    if (isDraggingRef.current) return; // Block concurrent drags
+    isDraggingRef.current = true;
     const card = board.cards.find(c => c.id === event.active.id);
     if (card) setActiveCard(card);
   }, [board.cards]);
@@ -96,85 +102,115 @@ export default function KanbanBoardClient() {
     setOverId(event.over?.id ? String(event.over.id) : null);
   }, []);
 
-  const handleDragEnd = useCallback((event: DragEndEvent) => {
+  const handleDragEnd = useCallback(async (event: DragEndEvent) => {
     setActiveCard(null);
     setOverId(null);
+    isDraggingRef.current = false;
+
     const { active, over } = event;
     if (!over || active.id === over.id) return;
 
     const activeId = String(active.id);
-    const overId = String(over.id);
+    const overIdStr = String(over.id);
 
-    if (columnIds.includes(activeId) && columnIds.includes(overId)) {
+    if (columnIds.includes(activeId) && columnIds.includes(overIdStr)) {
       const oldIndex = columnIds.indexOf(activeId);
-      const newIndex = columnIds.indexOf(overId);
+      const newIndex = columnIds.indexOf(overIdStr);
       const reordered = arrayMove(columnIds, oldIndex, newIndex);
-      reorderColumns(reordered);
+      const result = await reorderColumns(reordered);
+      if (result.error) {
+        toast.error(`Failed to reorder columns: ${result.error}`);
+      }
       return;
     }
 
     const draggedCard = board.cards.find(c => c.id === activeId);
     if (!draggedCard) return;
 
-    if (columnIds.includes(overId)) {
-      const targetCards = getColumnCards(overId);
-      moveCard(activeId, overId, targetCards.length);
-      toast.success('Card moved');
+    if (columnIds.includes(overIdStr)) {
+      const targetCards = getColumnCards(overIdStr);
+      const result = await moveCard(activeId, overIdStr, targetCards.length);
+      if (result.error) {
+        toast.error(`Failed to move card: ${result.error}`);
+      } else {
+        toast.success('Card moved');
+      }
       return;
     }
 
-    const overCard = board.cards.find(c => c.id === overId);
+    const overCard = board.cards.find(c => c.id === overIdStr);
     if (!overCard) return;
 
     const targetColumnId = overCard.columnId;
     const targetCards = getColumnCards(targetColumnId);
-    const overIndex = targetCards.findIndex(c => c.id === overId);
+    const overIndex = targetCards.findIndex(c => c.id === overIdStr);
 
-    moveCard(activeId, targetColumnId, overIndex);
-    if (draggedCard.columnId !== targetColumnId) {
+    const result = await moveCard(activeId, targetColumnId, overIndex);
+    if (result.error) {
+      toast.error(`Failed to move card: ${result.error}`);
+    } else if (draggedCard.columnId !== targetColumnId) {
       toast.success('Card moved');
     }
   }, [board.cards, columnIds, getColumnCards, moveCard, reorderColumns]);
 
-  const handleAddColumn = useCallback((title: string) => {
-    addColumn(title);
-    toast.success(`Column "${title}" created`);
+  const handleAddColumn = useCallback(async (title: string) => {
+    const result = await addColumn(title);
+    if (result.error) {
+      toast.error(`Failed to create column: ${result.error}`);
+    } else {
+      toast.success(`Column "${title}" created`);
+    }
   }, [addColumn]);
 
-  const handleRenameColumn = useCallback((columnId: string, title: string) => {
-    renameColumn(columnId, title);
+  const handleRenameColumn = useCallback(async (columnId: string, title: string) => {
+    const result = await renameColumn(columnId, title);
+    if (result.error) {
+      toast.error(`Failed to rename column: ${result.error}`);
+    }
   }, [renameColumn]);
 
   const handleDeleteColumnRequest = useCallback((columnId: string) => {
     setDeletingColumnId(columnId);
   }, []);
 
-  const handleDeleteColumnConfirm = useCallback(() => {
+  const handleDeleteColumnConfirm = useCallback(async () => {
     if (!deletingColumnId) return;
     const col = board.columns.find(c => c.id === deletingColumnId);
     const cardCount = board.cards.filter(c => c.columnId === deletingColumnId).length;
-    deleteColumn(deletingColumnId);
     setDeletingColumnId(null);
-    toast.success(
-      cardCount > 0
-        ? `Column "${col?.title}" and ${cardCount} card${cardCount !== 1 ? 's' : ''} deleted`
-        : `Column "${col?.title}" deleted`
-    );
+    const result = await deleteColumn(deletingColumnId);
+    if (result.error) {
+      toast.error(`Failed to delete column: ${result.error}`);
+    } else {
+      toast.success(
+        cardCount > 0
+          ? `Column "${col?.title}" and ${cardCount} card${cardCount !== 1 ? 's' : ''} deleted`
+          : `Column "${col?.title}" deleted`
+      );
+    }
   }, [deletingColumnId, board.columns, board.cards, deleteColumn]);
 
-  const handleAddCard = useCallback((columnId: string, title: string) => {
-    addCard(columnId, title);
-    toast.success('Card added');
+  const handleAddCard = useCallback(async (columnId: string, title: string) => {
+    const result = await addCard(columnId, title);
+    if (result.error) {
+      toast.error(`Failed to add card: ${result.error}`);
+    } else {
+      toast.success('Card added');
+    }
   }, [addCard]);
 
   const handleCardClick = useCallback((card: Card) => {
     setEditingCard(card);
   }, []);
 
-  const handleCardSave = useCallback((cardId: string, updates: Partial<Card>) => {
-    updateCard(cardId, updates);
+  const handleCardSave = useCallback(async (cardId: string, updates: Partial<Card>) => {
+    const result = await updateCard(cardId, updates);
     setEditingCard(null);
-    toast.success('Card updated');
+    if (result.error) {
+      toast.error(`Failed to update card: ${result.error}`);
+    } else {
+      toast.success('Card updated');
+    }
   }, [updateCard]);
 
   const handleDeleteCardRequest = useCallback((cardId: string) => {
@@ -182,12 +218,17 @@ export default function KanbanBoardClient() {
     setEditingCard(null);
   }, []);
 
-  const handleDeleteCardConfirm = useCallback(() => {
+  const handleDeleteCardConfirm = useCallback(async () => {
     if (!deletingCardId) return;
-    deleteCard(deletingCardId);
+    const cardTitle = board.cards.find(c => c.id === deletingCardId)?.title;
     setDeletingCardId(null);
-    toast.success('Card deleted');
-  }, [deletingCardId, deleteCard]);
+    const result = await deleteCard(deletingCardId);
+    if (result.error) {
+      toast.error(`Failed to delete card: ${result.error}`);
+    } else {
+      toast.success(`"${cardTitle}" deleted`);
+    }
+  }, [deletingCardId, board.cards, deleteCard]);
 
   const deletingColumn = board.columns.find(c => c.id === deletingColumnId);
   const deletingColumnCardCount = deletingColumnId
@@ -199,7 +240,6 @@ export default function KanbanBoardClient() {
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       const target = e.target as HTMLElement;
-      // Don't fire when typing in inputs/textareas
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
 
       const isMac = navigator.platform.toUpperCase().includes('MAC');
@@ -230,6 +270,15 @@ export default function KanbanBoardClient() {
             borderRadius: '10px',
           },
         }}
+      />
+
+      {/* Sync progress bar — shown while any Supabase operation is in-flight */}
+      <div
+        className={`fixed top-0 left-0 right-0 z-50 h-0.5 bg-indigo-500 transition-opacity duration-300 ${
+          isLoading ? 'opacity-100' : 'opacity-0'
+        }`}
+        style={isLoading ? { animation: 'progress-indeterminate 1.4s ease-in-out infinite' } : {}}
+        aria-hidden="true"
       />
 
       <BoardTopbar

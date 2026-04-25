@@ -127,36 +127,217 @@ Open [http://localhost:4028](http://localhost:4028) to see the board.
 
 ---
 
-## 🗄 Data Model
+## 🔧 Detailed Setup Guide
 
-```
-boards
-  id TEXT PK
-  title TEXT
-  created_at TIMESTAMPTZ
+### 1 — Clone & Install
 
-columns
-  id TEXT PK
-  board_id TEXT → boards(id) ON DELETE CASCADE
-  title TEXT
-  col_order INTEGER          -- display position (0-based)
-  color TEXT                 -- hex color for the column dot
-  created_at TIMESTAMPTZ
-
-cards
-  id TEXT PK
-  column_id TEXT → columns(id) ON DELETE CASCADE
-  title TEXT
-  description TEXT
-  card_order INTEGER          -- position within the column (0-based)
-  label TEXT                  -- 'bug' | 'feature' | 'improvement' | 'chore' | NULL
-  due_date TEXT               -- ISO date string (YYYY-MM-DD) or NULL
-  created_at TIMESTAMPTZ
+```bash
+git clone <your-repo-url>
+cd kanban-board
+npm install
 ```
 
-**Cascading deletes**: Deleting a board removes all its columns; deleting a column removes all its cards. This is enforced at the database level via `ON DELETE CASCADE` foreign keys, so the application layer only needs to issue a single `DELETE` on the parent row.
+All runtime and dev dependencies (Next.js, Supabase client, dnd-kit, react-hook-form, sonner, Tailwind CSS, etc.) are declared in `package.json` and installed in one step.
 
-**Order handling**: Both `col_order` and `card_order` are integer positions (0-based). On every drag-end, the affected rows are batch-updated in parallel. There is no gap-based ordering — positions are always compacted to `[0, 1, 2, …]` after each reorder.
+---
+
+### 2 — Create a Supabase Project
+
+1. Go to [https://supabase.com](https://supabase.com) and sign in (or create a free account).
+2. Click **New project**, choose a name and a strong database password, then click **Create new project**.
+3. Wait ~2 minutes for the project to provision.
+4. Navigate to **Settings → API** and copy:
+   - **Project URL** → `NEXT_PUBLIC_SUPABASE_URL`
+   - **anon / public key** → `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+
+---
+
+### 3 — Configure Environment Variables
+
+Create a `.env.local` file at the project root (never commit this file):
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-key>
+```
+
+> **Tip**: The `.env` file already exists in this repo with placeholder values. Rename it to `.env.local` or create a new `.env.local` that overrides it — Next.js loads `.env.local` last and it takes precedence.
+
+---
+
+### 4 — Apply the Database Migration
+
+The full schema (tables, indexes, RLS policies, and seed data) lives in a single migration file:
+
+```
+supabase/migrations/20260424104009_kanban_board.sql
+```
+
+**Option A — Supabase CLI (recommended)**
+
+```bash
+# Install the CLI if you haven't already
+npm install -g supabase
+
+# Link to your remote project (you'll be prompted for your project ref and DB password)
+npx supabase link --project-ref <your-project-ref>
+
+# Push the migration
+npx supabase db push
+```
+
+**Option B — Supabase Dashboard SQL Editor**
+
+1. Open your project in the Supabase dashboard.
+2. Go to **SQL Editor → New query**.
+3. Paste the entire contents of `supabase/migrations/20260424104009_kanban_board.sql`.
+4. Click **Run**.
+
+After the migration runs you should see three tables in **Table Editor**: `boards`, `columns`, and `cards`, pre-seeded with the default board and three starter columns.
+
+---
+
+### 5 — Start the Development Server
+
+```bash
+npm run dev
+```
+
+Visit [http://localhost:4028](http://localhost:4028). The board loads the seed data from Supabase on first render.
+
+---
+
+### 6 — Production Build
+
+```bash
+npm run build   # type-check + compile
+npm run start   # serve the compiled output
+```
+
+For deployment, set the two `NEXT_PUBLIC_*` environment variables in your hosting provider's dashboard (Vercel, Netlify, Railway, etc.) — no other configuration is required.
+
+---
+
+## 🏗 Architecture
+
+### High-Level Overview
+
+```
+Browser
+  └── Next.js App Router (React 19)
+        ├── Server Component  →  page.tsx          (initial data fetch)
+        └── Client Component  →  KanbanBoardClient  (all interactivity)
+              ├── DnD Context  (@dnd-kit)
+              ├── useBoardState hook  (state + optimistic mutations)
+              │     └── boardApi.ts  (Supabase CRUD)
+              │           └── Supabase JS client  →  PostgreSQL (Supabase)
+              └── UI Components
+                    ├── KanbanColumn  (sortable column)
+                    ├── CardItem      (sortable card)
+                    ├── CardDetailModal
+                    ├── BoardTopbar
+                    ├── AddColumnButton
+                    └── ConfirmModal
+```
+
+---
+
+### Layer Responsibilities
+
+#### `page.tsx` — Server Component (Route Entry Point)
+- Runs on the server; performs the initial Supabase fetch using the service-role-safe `createClient()`.
+- Passes the serialized board snapshot to `KanbanBoardClient` as a prop.
+- Keeps the route boundary clean: zero client-side JavaScript is shipped for this file.
+
+#### `KanbanBoardClient.tsx` — Root Client Component
+- Owns the `DndContext` and `SortableContext` from `@dnd-kit`.
+- Handles `onDragEnd` events and delegates to `useBoardState` for state updates.
+- Renders the column list, topbar, modals, and the add-column button.
+- Manages the hydration guard (`isHydrated` flag) to prevent server/client HTML mismatches.
+
+#### `hooks/useBoardState.ts` — State & Optimistic Mutation Layer
+- Single source of truth for the in-memory board (`Board` object).
+- Every mutation follows the **optimistic update pattern**:
+  1. Apply the change to local state immediately (instant UI feedback).
+  2. Fire the async Supabase call in the background.
+  3. On failure: roll back to the previous snapshot and show an error toast.
+- Exposes stable callbacks (`addCard`, `moveCard`, `deleteColumn`, etc.) consumed by child components.
+- Wraps `useUndoRedo` to maintain a history stack for Ctrl+Z / Ctrl+Y.
+
+#### `api/boardApi.ts` — Data Access Layer
+- Pure async functions; no React, no state.
+- Each function returns `ApiResult<T>` (`{ data, error }`) for consistent error handling.
+- Handles snake_case ↔ camelCase conversion via `dbColToColumn` / `dbCardToCard` mappers.
+- Batch reorders use `Promise.all` over individual `UPDATE` statements (see Trade-offs).
+
+#### `lib/supabase/client.ts` — Supabase Client Factory
+- Creates a single `SupabaseClient` instance using `@supabase/ssr`.
+- Falls back to `localStorage` when cookies are unavailable (pure client-side context).
+
+#### `contexts/MultiBoardContext.tsx` — Multi-Board Registry
+- Maintains a list of known board IDs in `localStorage`.
+- Currently the app only uses `board-001`, but the context is wired up for future multi-board support without requiring a schema change.
+
+#### `contexts/ThemeContext.tsx` — Theme Provider
+- Manages `light` / `dark` mode preference, persisted to `localStorage`.
+- Applies the `dark` class to `<html>` so Tailwind's `dark:` variants work globally.
+
+---
+
+### Data Flow — Card Move (Drag & Drop)
+
+```
+User drops card onto new column
+        │
+        ▼
+KanbanBoardClient.onDragEnd()
+        │  identifies source column, destination column, new index
+        ▼
+useBoardState.moveCard(cardId, fromColId, toColId, newIndex)
+        │
+        ├─ 1. Snapshot current board state
+        ├─ 2. Compute new card_order values for affected columns
+        ├─ 3. setState(newBoard)          ← UI updates instantly
+        │
+        └─ 4. boardApi.apiMoveCard(...)   ← async Supabase call
+                  │
+                  ├─ SUCCESS → no-op (UI already correct)
+                  └─ FAILURE → setState(snapshot) + toast.error(...)
+```
+
+---
+
+### Component Tree
+
+```
+KanbanBoardClient
+├── BoardTopbar
+│     └── search input, stats counters, theme toggle, undo/redo buttons
+├── DndContext
+│   └── SortableContext (columns)
+│         └── KanbanColumn[]
+│               ├── column header (title, color dot, action menu)
+│               ├── SortableContext (cards)
+│               │     └── CardItem[]
+│               │           └── overdue badge, label chip, due date
+│               └── "Add card" inline form
+├── AddColumnButton
+├── CardDetailModal   (portal, shown when a card is clicked)
+└── ConfirmModal      (portal, shown before destructive actions)
+```
+
+---
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| Server Component for initial fetch | Avoids a client-side loading flash; the skeleton only shows on subsequent navigations |
+| Optimistic UI with snapshot rollback | Keeps interactions feeling instant while guaranteeing consistency on failure |
+| `ApiResult<T>` wrapper | Uniform `{ data, error }` shape prevents uncaught promise rejections and makes error handling explicit at every call site |
+| `col_order` / `card_order` as compacted integers | Simple to reason about; no floating-point drift or gap-based ordering complexity |
+| `@dnd-kit` over `react-beautiful-dnd` | Actively maintained, accessible by default, and works with React 19 concurrent mode |
+| Single migration file | Keeps the DB setup to one copy-paste step; no migration runner needed for a single-board app |
 
 ---
 
