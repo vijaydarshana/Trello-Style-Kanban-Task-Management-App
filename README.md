@@ -151,9 +151,7 @@ All runtime and dev dependencies (Next.js, Supabase client, dnd-kit, react-hook-
 
 Create a `.env.local` file at the project root (never commit this file):
 
-```env
-NEXT_PUBLIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-key>
+
 ```
 
 > **Tip**: The `.env` file already exists in this repo with placeholder values. Rename it to `.env.local` or create a new `.env.local` that overrides it — Next.js loads `.env.local` last and it takes precedence.
