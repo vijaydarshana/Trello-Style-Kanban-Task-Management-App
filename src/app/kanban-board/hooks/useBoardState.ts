@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useState, useRef } from 'react';
 import type { Board, Column, Card } from '../types';
 import { useMultiBoard } from '@/contexts/MultiBoardContext';
 import { useUndoRedo } from './useUndoRedo';
@@ -20,6 +20,12 @@ export function useBoardState() {
   const [pendingOps, setPendingOps] = useState<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
 
+  // Always-current ref — prevents stale closures in async callbacks
+  const boardsRef = useRef(boards);
+  boardsRef.current = boards;
+  const activeBoardIdRef = useRef(activeBoardId);
+  activeBoardIdRef.current = activeBoardId;
+
   const board: Board = boards.find(b => b.id === activeBoardId) ?? boards[0] ?? {
     id: 'fallback',
     title: 'Board',
@@ -27,74 +33,48 @@ export function useBoardState() {
     cards: [],
   };
 
-  // ─── Internal setter that always persists via context ────────────────────────
-  const persist = useCallback((updater: (b: Board) => Board) => {
-    const current = boards.find(b => b.id === activeBoardId);
-    if (!current) return;
-    const next = updater(current);
-    updateBoard(next);
-  }, [boards, activeBoardId, updateBoard]);
-
   // ─── Undo/Redo ────────────────────────────────────────────────────────────────
   const { canUndo, canRedo, undo, redo, pushHistory } = useUndoRedo(
     board,
     (restoredBoard) => updateBoard(restoredBoard)
   );
 
-  // Helper: snapshot current board before a mutation
-  const persistWithHistory = useCallback((updater: (b: Board) => Board) => {
-    const current = boards.find(b => b.id === activeBoardId);
-    if (!current) return;
-    pushHistory(current);
-    const next = updater(current);
-    updateBoard(next);
-  }, [boards, activeBoardId, updateBoard, pushHistory]);
-
-  // ─── Async sync with rollback on failure ─────────────────────────────────────
-  const syncWithRollback = useCallback(
+  // ─── localStorage-first: apply immediately, sync to Supabase silently ────────
+  // Changes are committed to localStorage instantly. Supabase is a background
+  // mirror — failures are swallowed silently; localStorage state is never rolled back.
+  const syncToSupabase = useCallback(
     async <T>(
       opKey: string,
       optimisticUpdater: (b: Board) => Board,
-      apiCall: () => Promise<{ data: T | null; error: string | null }>,
-      onError?: (err: string) => void
+      apiCall: () => Promise<{ data: T | null; error: string | null }>
     ): Promise<{ error: string | null }> => {
-      const current = boards.find(b => b.id === activeBoardId);
+      const current = boardsRef.current.find(b => b.id === activeBoardIdRef.current);
       if (!current) return { error: 'Board not found' };
 
-      // Snapshot for rollback
-      const snapshot = current;
-
-      // Apply optimistic update
+      // 1. Commit to localStorage immediately (source of truth)
       pushHistory(current);
       const next = optimisticUpdater(current);
       updateBoard(next);
 
-      // Mark operation as pending
+      // 2. Show sync indicator
       setPendingOps(prev => new Set(prev).add(opKey));
 
+      // 3. Background sync to Supabase — silent, no rollback on failure
       try {
-        const result = await apiCall();
-        if (result.error) {
-          // Rollback to snapshot
-          updateBoard(snapshot);
-          onError?.(result.error);
-          return { error: result.error };
-        }
-        return { error: null };
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Operation failed';
-        updateBoard(snapshot);
-        onError?.(msg);
-        return { error: msg };
+        await apiCall();
+      } catch {
+        // Supabase sync failed silently — localStorage state is preserved
       } finally {
         setPendingOps(prev => {
-          const next = new Set(prev);
-          next.delete(opKey);
-          return next;
+          const updated = new Set(prev);
+          updated.delete(opKey);
+          return updated;
         });
       }
+
+      return { error: null };
     },
-    [boards, activeBoardId, updateBoard, pushHistory]
+    [updateBoard, pushHistory]
   );
 
   // ─── Column operations ────────────────────────────────────────────────────────
@@ -104,7 +84,7 @@ export function useBoardState() {
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
     const colors = ['#6366f1', '#f59e0b', '#8b5cf6', '#10b981', '#ef4444', '#0ea5e9', '#f97316'];
-    const current = boards.find(b => b.id === activeBoardId);
+    const current = boardsRef.current.find(b => b.id === activeBoardIdRef.current);
     if (!current) return { error: 'Board not found' };
 
     const maxOrder = current.columns.reduce((m, c) => Math.max(m, c.order), -1);
@@ -116,42 +96,39 @@ export function useBoardState() {
       color: colors[colorIndex],
     };
 
-    return syncWithRollback(
+    return syncToSupabase(
       `addColumn-${col.id}`,
       b => ({ ...b, columns: [...b.columns, col] }),
-      () => createColumn(col, current.id),
-      onError
+      () => createColumn(col, current.id)
     );
-  }, [boards, activeBoardId, syncWithRollback]);
+  }, [syncToSupabase]);
 
   const renameColumn = useCallback(async (
     columnId: string,
     title: string,
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
-    return syncWithRollback(
+    return syncToSupabase(
       `renameColumn-${columnId}`,
       b => ({ ...b, columns: b.columns.map(c => c.id === columnId ? { ...c, title } : c) }),
-      () => updateColumn(columnId, { title }),
-      onError
+      () => updateColumn(columnId, { title })
     );
-  }, [syncWithRollback]);
+  }, [syncToSupabase]);
 
   const deleteColumn = useCallback(async (
     columnId: string,
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
-    return syncWithRollback(
+    return syncToSupabase(
       `deleteColumn-${columnId}`,
       b => ({
         ...b,
         columns: b.columns.filter(c => c.id !== columnId),
         cards: b.cards.filter(card => card.columnId !== columnId),
       }),
-      () => apiDeleteColumn(columnId),
-      onError
+      () => apiDeleteColumn(columnId)
     );
-  }, [syncWithRollback]);
+  }, [syncToSupabase]);
 
   // ─── Card operations ──────────────────────────────────────────────────────────
 
@@ -160,7 +137,7 @@ export function useBoardState() {
     title: string,
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
-    const current = boards.find(b => b.id === activeBoardId);
+    const current = boardsRef.current.find(b => b.id === activeBoardIdRef.current);
     if (!current) return { error: 'Board not found' };
 
     const colCards = current.cards.filter(c => c.columnId === columnId);
@@ -175,38 +152,35 @@ export function useBoardState() {
       dueDate: null,
     };
 
-    return syncWithRollback(
+    return syncToSupabase(
       `addCard-${card.id}`,
       b => ({ ...b, cards: [...b.cards, card] }),
-      () => createCard(card),
-      onError
+      () => createCard(card)
     );
-  }, [boards, activeBoardId, syncWithRollback]);
+  }, [syncToSupabase]);
 
   const updateCard = useCallback(async (
     cardId: string,
     updates: Partial<Card>,
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
-    return syncWithRollback(
+    return syncToSupabase(
       `updateCard-${cardId}`,
       b => ({ ...b, cards: b.cards.map(c => c.id === cardId ? { ...c, ...updates } : c) }),
-      () => apiUpdateCard(cardId, updates),
-      onError
+      () => apiUpdateCard(cardId, updates)
     );
-  }, [syncWithRollback]);
+  }, [syncToSupabase]);
 
   const deleteCard = useCallback(async (
     cardId: string,
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
-    return syncWithRollback(
+    return syncToSupabase(
       `deleteCard-${cardId}`,
       b => ({ ...b, cards: b.cards.filter(c => c.id !== cardId) }),
-      () => apiDeleteCard(cardId),
-      onError
+      () => apiDeleteCard(cardId)
     );
-  }, [syncWithRollback]);
+  }, [syncToSupabase]);
 
   // ─── Drag & drop ──────────────────────────────────────────────────────────────
 
@@ -216,13 +190,12 @@ export function useBoardState() {
     targetIndex: number,
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
-    const current = boards.find(b => b.id === activeBoardId);
+    const current = boardsRef.current.find(b => b.id === activeBoardIdRef.current);
     if (!current) return { error: 'Board not found' };
 
     const card = current.cards.find(c => c.id === cardId);
     if (!card) return { error: 'Card not found' };
 
-    // Pre-compute the affected cards for the API call
     const withoutCard = current.cards.filter(c => c.id !== cardId);
     const targetCards = withoutCard
       .filter(c => c.columnId === targetColumnId)
@@ -249,32 +222,30 @@ export function useBoardState() {
       order: c.order,
     }));
 
-    return syncWithRollback(
+    return syncToSupabase(
       `moveCard-${cardId}-${Date.now()}`,
       b => ({ ...b, cards: newCards }),
-      () => apiMoveCard(affectedCards),
-      onError
+      () => apiMoveCard(affectedCards)
     );
-  }, [boards, activeBoardId, syncWithRollback]);
+  }, [syncToSupabase]);
 
   const reorderColumns = useCallback(async (
     orderedIds: string[],
     onError?: (err: string) => void
   ): Promise<{ error: string | null }> => {
-    const current = boards.find(b => b.id === activeBoardId);
+    const current = boardsRef.current.find(b => b.id === activeBoardIdRef.current);
     if (!current) return { error: 'Board not found' };
 
     const newColumns = current.columns
       .map(col => ({ ...col, order: orderedIds.indexOf(col.id) }))
       .sort((a, b) => a.order - b.order);
 
-    return syncWithRollback(
+    return syncToSupabase(
       `reorderColumns-${Date.now()}`,
       () => ({ ...current, columns: newColumns }),
-      () => apiReorderColumns(newColumns.map(c => ({ id: c.id, order: c.order }))),
-      onError
+      () => apiReorderColumns(newColumns.map(c => ({ id: c.id, order: c.order })))
     );
-  }, [boards, activeBoardId, syncWithRollback]);
+  }, [syncToSupabase]);
 
   const isLoading = pendingOps.size > 0;
 
@@ -292,7 +263,6 @@ export function useBoardState() {
     deleteCard,
     moveCard,
     reorderColumns,
-    // Undo/Redo
     canUndo,
     canRedo,
     undo,

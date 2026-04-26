@@ -1,29 +1,12 @@
 'use client';
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import {
-  DndContext,
-  DragOverlay,
-  PointerSensor,
-  KeyboardSensor,
-  useSensor,
-  useSensors,
-  closestCorners,
-  type DragStartEvent,
-  type DragOverEvent,
-  type DragEndEvent,
-} from '@dnd-kit/core';
-import {
-  SortableContext,
-  horizontalListSortingStrategy,
-  arrayMove,
-} from '@dnd-kit/sortable';
+import { DragDropContext, Droppable, type DropResult } from '@hello-pangea/dnd';
 import { Toaster, toast } from 'sonner';
 import { useBoardState } from '../hooks/useBoardState';
 import { useMultiBoard } from '@/contexts/MultiBoardContext';
 import BoardTopbar from './BoardTopbar';
 import KanbanColumn from './KanbanColumn';
-import CardItem from './CardItem';
 import AddColumnButton from './AddColumnButton';
 import CardDetailModal from './CardDetailModal';
 import ConfirmModal from './ConfirmModal';
@@ -50,23 +33,15 @@ export default function KanbanBoardClient() {
 
   const { isHydrated } = useMultiBoard();
 
-  const [activeCard, setActiveCard] = useState<Card | null>(null);
   const [editingCard, setEditingCard] = useState<Card | null>(null);
   const [deletingCardId, setDeletingCardId] = useState<string | null>(null);
   const [deletingColumnId, setDeletingColumnId] = useState<string | null>(null);
-  const [overId, setOverId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Drag lock: prevents concurrent/fast-drag conflicts
-  const isDraggingRef = useRef(false);
-
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor)
-  );
+  const boardRef = useRef(board);
+  boardRef.current = board;
 
   const sortedColumns = [...board.columns].sort((a, b) => a.order - b.order);
-  const columnIds = sortedColumns.map(c => c.id);
 
   const getColumnCards = useCallback(
     (columnId: string) =>
@@ -90,68 +65,43 @@ export default function KanbanBoardClient() {
     [getColumnCards, searchQuery]
   );
 
-  // DnD handlers
-  const handleDragStart = useCallback((event: DragStartEvent) => {
-    if (isDraggingRef.current) return; // Block concurrent drags
-    isDraggingRef.current = true;
-    const card = board.cards.find(c => c.id === event.active.id);
-    if (card) setActiveCard(card);
-  }, [board.cards]);
+  // ─── DnD handler ─────────────────────────────────────────────────────────────
 
-  const handleDragOver = useCallback((event: DragOverEvent) => {
-    setOverId(event.over?.id ? String(event.over.id) : null);
-  }, []);
+  const handleDragEnd = useCallback(async (result: DropResult) => {
+    const { source, destination, type } = result;
 
-  const handleDragEnd = useCallback(async (event: DragEndEvent) => {
-    setActiveCard(null);
-    setOverId(null);
-    isDraggingRef.current = false;
+    // Dropped outside any droppable
+    if (!destination) return;
 
-    const { active, over } = event;
-    if (!over || active.id === over.id) return;
+    // No movement
+    if (
+      source.droppableId === destination.droppableId &&
+      source.index === destination.index
+    ) return;
 
-    const activeId = String(active.id);
-    const overIdStr = String(over.id);
+    const currentBoard = boardRef.current;
 
-    if (columnIds.includes(activeId) && columnIds.includes(overIdStr)) {
-      const oldIndex = columnIds.indexOf(activeId);
-      const newIndex = columnIds.indexOf(overIdStr);
-      const reordered = arrayMove(columnIds, oldIndex, newIndex);
-      const result = await reorderColumns(reordered);
-      if (result.error) {
-        toast.error(`Failed to reorder columns: ${result.error}`);
-      }
+    // ── Column reorder ──────────────────────────────────────────────────────────
+    if (type === 'COLUMN') {
+      const cols = [...currentBoard.columns].sort((a, b) => a.order - b.order);
+      const [moved] = cols.splice(source.index, 1);
+      cols.splice(destination.index, 0, moved);
+      const reorderedIds = cols.map(c => c.id);
+      await reorderColumns(reorderedIds);
       return;
     }
 
-    const draggedCard = board.cards.find(c => c.id === activeId);
-    if (!draggedCard) return;
+    // ── Card move ───────────────────────────────────────────────────────────────
+    const sourceColumnId = source.droppableId;
+    const destColumnId = destination.droppableId;
 
-    if (columnIds.includes(overIdStr)) {
-      const targetCards = getColumnCards(overIdStr);
-      const result = await moveCard(activeId, overIdStr, targetCards.length);
-      if (result.error) {
-        toast.error(`Failed to move card: ${result.error}`);
-      } else {
-        toast.success('Card moved');
-      }
-      return;
-    }
-
-    const overCard = board.cards.find(c => c.id === overIdStr);
-    if (!overCard) return;
-
-    const targetColumnId = overCard.columnId;
-    const targetCards = getColumnCards(targetColumnId);
-    const overIndex = targetCards.findIndex(c => c.id === overIdStr);
-
-    const result = await moveCard(activeId, targetColumnId, overIndex);
-    if (result.error) {
-      toast.error(`Failed to move card: ${result.error}`);
-    } else if (draggedCard.columnId !== targetColumnId) {
+    await moveCard(result.draggableId, destColumnId, destination.index);
+    if (sourceColumnId !== destColumnId) {
       toast.success('Card moved');
     }
-  }, [board.cards, columnIds, getColumnCards, moveCard, reorderColumns]);
+  }, [moveCard, reorderColumns]);
+
+  // ─── Column / Card action handlers ──────────────────────────────────────────
 
   const handleAddColumn = useCallback(async (title: string) => {
     const result = await addColumn(title);
@@ -175,8 +125,8 @@ export default function KanbanBoardClient() {
 
   const handleDeleteColumnConfirm = useCallback(async () => {
     if (!deletingColumnId) return;
-    const col = board.columns.find(c => c.id === deletingColumnId);
-    const cardCount = board.cards.filter(c => c.columnId === deletingColumnId).length;
+    const col = boardRef.current.columns.find(c => c.id === deletingColumnId);
+    const cardCount = boardRef.current.cards.filter(c => c.columnId === deletingColumnId).length;
     setDeletingColumnId(null);
     const result = await deleteColumn(deletingColumnId);
     if (result.error) {
@@ -188,7 +138,7 @@ export default function KanbanBoardClient() {
           : `Column "${col?.title}" deleted`
       );
     }
-  }, [deletingColumnId, board.columns, board.cards, deleteColumn]);
+  }, [deletingColumnId, deleteColumn]);
 
   const handleAddCard = useCallback(async (columnId: string, title: string) => {
     const result = await addCard(columnId, title);
@@ -220,7 +170,7 @@ export default function KanbanBoardClient() {
 
   const handleDeleteCardConfirm = useCallback(async () => {
     if (!deletingCardId) return;
-    const cardTitle = board.cards.find(c => c.id === deletingCardId)?.title;
+    const cardTitle = boardRef.current.cards.find(c => c.id === deletingCardId)?.title;
     setDeletingCardId(null);
     const result = await deleteCard(deletingCardId);
     if (result.error) {
@@ -228,7 +178,7 @@ export default function KanbanBoardClient() {
     } else {
       toast.success(`"${cardTitle}" deleted`);
     }
-  }, [deletingCardId, board.cards, deleteCard]);
+  }, [deletingCardId, deleteCard]);
 
   const deletingColumn = board.columns.find(c => c.id === deletingColumnId);
   const deletingColumnCardCount = deletingColumnId
@@ -236,7 +186,7 @@ export default function KanbanBoardClient() {
     : 0;
   const deletingCardObj = board.cards.find(c => c.id === deletingCardId);
 
-  // ─── Keyboard shortcuts for undo/redo ─────────────────────────────────────────
+  // ─── Keyboard shortcuts for undo/redo ────────────────────────────────────────
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
       const target = e.target as HTMLElement;
@@ -272,7 +222,7 @@ export default function KanbanBoardClient() {
         }}
       />
 
-      {/* Sync progress bar — shown while any Supabase operation is in-flight */}
+      {/* Sync progress bar */}
       <div
         className={`fixed top-0 left-0 right-0 z-50 h-0.5 bg-indigo-500 transition-opacity duration-300 ${
           isLoading ? 'opacity-100' : 'opacity-0'
@@ -293,48 +243,33 @@ export default function KanbanBoardClient() {
       />
 
       <main className="flex-1 overflow-x-auto overflow-y-hidden">
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCorners}
-          onDragStart={handleDragStart}
-          onDragOver={handleDragOver}
-          onDragEnd={handleDragEnd}
-        >
-          <SortableContext items={columnIds} strategy={horizontalListSortingStrategy}>
-            <div className="flex gap-4 px-6 py-5 h-full items-start min-w-max">
-              {sortedColumns.map(column => (
-                <KanbanColumn
-                  key={column.id}
-                  column={column}
-                  cards={getFilteredColumnCards(column.id)}
-                  isOver={overId === column.id}
-                  isDraggingCard={!!activeCard}
-                  onRename={handleRenameColumn}
-                  onDeleteRequest={handleDeleteColumnRequest}
-                  onAddCard={handleAddCard}
-                  onCardClick={handleCardClick}
-                  onDeleteCardRequest={handleDeleteCardRequest}
-                  activeCardId={activeCard?.id ?? null}
-                />
-              ))}
-
-              <AddColumnButton onAdd={handleAddColumn} />
-            </div>
-          </SortableContext>
-
-          <DragOverlay dropAnimation={{ duration: 150, easing: 'cubic-bezier(0.18, 0.67, 0.6, 1.22)' }}>
-            {activeCard ? (
-              <div className="card-drag-overlay w-72 rotate-2 scale-105">
-                <CardItem
-                  card={activeCard}
-                  isOverlay
-                  onCardClick={() => {}}
-                  onDeleteRequest={() => {}}
-                />
+        <DragDropContext onDragEnd={handleDragEnd}>
+          <Droppable droppableId="board" type="COLUMN" direction="horizontal">
+            {(provided) => (
+              <div
+                ref={provided.innerRef}
+                {...provided.droppableProps}
+                className="flex gap-4 px-6 py-5 h-full items-start min-w-max"
+              >
+                {sortedColumns.map((column, index) => (
+                  <KanbanColumn
+                    key={column.id}
+                    column={column}
+                    index={index}
+                    cards={getFilteredColumnCards(column.id)}
+                    onRename={handleRenameColumn}
+                    onDeleteRequest={handleDeleteColumnRequest}
+                    onAddCard={handleAddCard}
+                    onCardClick={handleCardClick}
+                    onDeleteCardRequest={handleDeleteCardRequest}
+                  />
+                ))}
+                {provided.placeholder}
+                <AddColumnButton onAdd={handleAddColumn} />
               </div>
-            ) : null}
-          </DragOverlay>
-        </DndContext>
+            )}
+          </Droppable>
+        </DragDropContext>
       </main>
 
       {editingCard && (
