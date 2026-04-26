@@ -74,12 +74,7 @@ supabase/
 
 Create a `.env.local` file at the project root:
 
-```env
-NEXT_PUBLIC_SUPABASE_URL=https://<your-project>.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-key>
-```
 
-Both values are available in your Supabase project under **Settings → API**.
 
 ---
 
@@ -156,9 +151,7 @@ All runtime and dev dependencies (Next.js, Supabase client, dnd-kit, react-hook-
 
 Create a `.env.local` file at the project root (never commit this file):
 
-```env
-NEXT_PUBLIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-key>
+
 ```
 
 > **Tip**: The `.env` file already exists in this repo with placeholder values. Rename it to `.env.local` or create a new `.env.local` that overrides it — Next.js loads `.env.local` last and it takes precedence.
@@ -204,6 +197,8 @@ npm run dev
 ```
 
 Visit [http://localhost:4028](http://localhost:4028). The board loads the seed data from Supabase on first render.
+
+live Link : https://trello-style-kanban-task-management.vercel.app/kanban-board
 
 ---
 
@@ -368,8 +363,3 @@ Due dates are stored as `TEXT` (`YYYY-MM-DD`) rather than `DATE`. This avoids ti
 
 **Production fix**: Store as `DATE` and handle timezone normalization in the API layer.
 
----
-
-## 🙏 Acknowledgments
-
-Built with [Rocket.new](https://rocket.new) · Powered by Next.js, React, and Supabase · Styled with Tailwind CSS
